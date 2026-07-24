@@ -1,6 +1,7 @@
 use async_openai::{Client, config::OpenAIConfig, types::chat::{ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionObjectArgs}};
 use clap::Parser;
 use serde_json::{Value, json};
+use tokio::{fs::File, io::AsyncWriteExt};
 use std::{env, process};
 
 #[derive(Parser)]
@@ -33,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ChatCompletionRequestUserMessageArgs::default().content(args.prompt.clone()).build()?.into()
     ];
 
-    let tools: Vec<ChatCompletionTools> = vec![ ChatCompletionTools::Function(ChatCompletionTool { function: FunctionObjectArgs::default()
+    let tools: Vec<ChatCompletionTools> = vec![ 
+        ChatCompletionTools::Function(ChatCompletionTool { function: FunctionObjectArgs::default()
             .name("Read")
             .description("Read and return the contents of a file")
             .parameters(json!({
@@ -45,6 +47,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 },
                 "required": ["file_path"]
+            }))
+            .build()?
+            .into()
+        }),
+        ChatCompletionTools::Function(ChatCompletionTool {
+            function: FunctionObjectArgs::default()
+            .name("Write")
+            .description("Write content to a file")
+            .parameters(json!({
+                "type": "object",
+                "required": ["file_path", "content"],
+                "properties": {
+                  "file_path": {
+                    "type": "string",
+                    "description": "The path of the file to write to"
+                  },
+                  "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                  }
+                }
             }))
             .build()?
             .into()
@@ -93,33 +116,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
 
-            if call.function.name != "Read" {
-                continue;
-            }
-
             let arguments: Value = match serde_json::from_str(&call.function.arguments) {
                 Ok(args) => args,
                 Err(e) => {
-                    eprintln!("Failed to parse Read arguments: {e}");
+                    eprintln!("Failed to parse tool call arguments: {e}");
                     continue;
                 }
             };
 
-            let Some(file_path) = arguments["file_path"].as_str() else {
-                eprintln!("Failed to parse Read arguments - file path not found");
-                continue;
-            };
+            let mut tool_message_args = ChatCompletionRequestToolMessageArgs::default();
+            
+            if call.function.name == "Read" {
+                let Some(file_path) = arguments["file_path"].as_str() else {
+                    eprintln!("Failed to parse Read arguments - file path not found");
+                    continue;
+                };
+    
+                let result = match tokio::fs::read_to_string(file_path).await {
+                    Ok(contents) => contents,
+                    Err(e) => format!("Error reading {file_path}: {e}"),
+                };
+    
+                let tool_message = tool_message_args
+                    .content(result)
+                    .tool_call_id(call.id)
+                    .build()?;
+                messages.push(tool_message.into());
 
-            let result = match tokio::fs::read_to_string(file_path).await {
-                Ok(contents) => contents,
-                Err(e) => format!("Error reading {file_path}: {e}"),
-            };
+            } else if call.function.name == "Write" {
+                let Some(file_path) = arguments["file_path"].as_str() else {
+                    eprintln!("Failed to parse Write arguments - file path not found");
+                    continue;
+                };
 
-            let tool_message = ChatCompletionRequestToolMessageArgs::default()
-                .content(result)
-                .tool_call_id(call.id)
-                .build()?;
-            messages.push(tool_message.into());
+                let Some(file_content) = arguments["content"].as_str() else {
+                    eprintln!("Failed to parse Write arguments - content not found");
+                    continue;
+                };
+
+                let mut file = File::create(file_path).await?;
+                file.write_all(file_content.as_bytes()).await?;
+                file.flush().await?;
+
+                let tool_message = tool_message_args
+                    .content("File written successfully")
+                    .tool_call_id(call.id)
+                    .build()?;
+                messages.push(tool_message.into());
+            }
+
+            
         }
     }
 
