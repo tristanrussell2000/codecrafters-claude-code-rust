@@ -13,11 +13,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-
     let base_url = env::var("OPENROUTER_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
 
-    let api_key = env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| {
+    let api_key = dotenvy::var("OPENROUTER_API_KEY").unwrap_or_else(|_| {
         eprintln!("OPENROUTER_API_KEY is not set");
         process::exit(1);
     });
@@ -62,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     eprintln!("Logs from your program will appear here!");
 
-    // TODO: Uncomment the lines below to pass the first stage
     if let Some(content) = response["choices"][0]["message"]["content"].as_str() {
         println!("{}", content);
     }
