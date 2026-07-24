@@ -1,7 +1,6 @@
-use async_openai::{Client, config::OpenAIConfig, types::chat::{ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionObjectArgs}};
+use async_openai::{Client, config::OpenAIConfig, types::chat::{ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionObjectArgs}};
 use clap::Parser;
 use serde_json::{Value, json};
-use tokio::{fs::File, io::AsyncWriteExt};
 use std::{env, process};
 
 #[derive(Parser)]
@@ -88,8 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let message = choice.message;
 
-        // Append the model's response to the conversation. Only set fields that
-        // are present — the builder strips `Option`, so it wants the inner value.
         let mut assistant = ChatCompletionRequestAssistantMessageArgs::default();
         if let Some(content) = message.content.clone() {
             assistant.content(content);
@@ -102,7 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         messages.push(assistant.build()?.into());
 
-        // No tool calls means the model gave a final answer — print it and stop.
         let Some(tool_calls) = message.tool_calls else {
             if let Some(content) = message.content {
                 println!("{content}");
@@ -110,64 +106,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         };
 
-        // Otherwise run each tool call and feed its result back as a tool message.
         for tool_call in tool_calls {
             let ChatCompletionMessageToolCalls::Function(call) = tool_call else {
                 continue;
             };
 
-            let arguments: Value = match serde_json::from_str(&call.function.arguments) {
-                Ok(args) => args,
-                Err(e) => {
-                    eprintln!("Failed to parse tool call arguments: {e}");
-                    continue;
-                }
-            };
+            let result = run_tool(&call).await.unwrap_or_else(|err| err);
 
-            let mut tool_message_args = ChatCompletionRequestToolMessageArgs::default();
-            
-            if call.function.name == "Read" {
-                let Some(file_path) = arguments["file_path"].as_str() else {
-                    eprintln!("Failed to parse Read arguments - file path not found");
-                    continue;
-                };
-    
-                let result = match tokio::fs::read_to_string(file_path).await {
-                    Ok(contents) => contents,
-                    Err(e) => format!("Error reading {file_path}: {e}"),
-                };
-    
-                let tool_message = tool_message_args
-                    .content(result)
-                    .tool_call_id(call.id)
-                    .build()?;
-                messages.push(tool_message.into());
-
-            } else if call.function.name == "Write" {
-                let Some(file_path) = arguments["file_path"].as_str() else {
-                    eprintln!("Failed to parse Write arguments - file path not found");
-                    continue;
-                };
-
-                let Some(file_content) = arguments["content"].as_str() else {
-                    eprintln!("Failed to parse Write arguments - content not found");
-                    continue;
-                };
-
-                let mut file = File::create(file_path).await?;
-                file.write_all(file_content.as_bytes()).await?;
-                file.flush().await?;
-
-                let tool_message = tool_message_args
-                    .content("File written successfully")
-                    .tool_call_id(call.id)
-                    .build()?;
-                messages.push(tool_message.into());
-            }
-
-            
+            let tool_message = ChatCompletionRequestToolMessageArgs::default()
+                .content(result)
+                .tool_call_id(call.id)
+                .build()?;
+            messages.push(tool_message.into());
         }
     }
 
     Ok(())
+}
+
+async fn run_tool(call: &ChatCompletionMessageToolCall) -> Result<String, String> {
+    let arguments: Value = serde_json::from_str(&call.function.arguments)
+        .map_err(|e| format!("Failed to parse tool arguments as JSON: {e}"))?;
+
+    match call.function.name.as_str() {
+        "Read" => {
+            let file_path = arguments["file_path"]
+                .as_str()
+                .ok_or("Missing required argument 'file_path'")?;
+            tokio::fs::read_to_string(file_path)
+                .await
+                .map_err(|e| format!("Error reading {file_path}: {e}"))
+        }
+        "Write" => {
+            let file_path = arguments["file_path"]
+                .as_str()
+                .ok_or("Missing required argument 'file_path'")?;
+            let content = arguments["content"]
+                .as_str()
+                .ok_or("Missing required argument 'content'")?;
+            tokio::fs::write(file_path, content)
+                .await
+                .map_err(|e| format!("Error writing {file_path}: {e}"))?;
+            Ok(format!("Wrote {} bytes to {file_path}", content.len()))
+        }
+        other => Err(format!("Unknown tool '{other}'")),
+    }
 }
