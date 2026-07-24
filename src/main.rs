@@ -1,8 +1,6 @@
-use async_openai::{Client, config::OpenAIConfig};
+use async_openai::{Client, config::OpenAIConfig, types::chat::{ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionObjectArgs}};
 use clap::Parser;
-use codecrafters_claude_code::extract_tool_arguments;
 use serde_json::{Value, json};
-use tokio::{fs::File, io};
 use std::{env, process};
 
 #[derive(Parser)]
@@ -30,52 +28,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_api_key(api_key);
 
     let client = Client::with_config(config);
-    
-    #[allow(unused_variables)]
-    let response: Value = client
-        .chat()
-        .create_byot(json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": args.prompt
-                }
-            ],
-            "model": "anthropic/claude-haiku-4.5",
-            "tools": [{
-              "type": "function",
-              "function": {
-                "name": "Read",
-                "description": "Read and return the contents of a file",
-                "parameters": {
-                  "type": "object",
-                  "properties": {
-                    "file_path": {
-                      "type": "string",
-                      "description": "The path to the file to read"
-                    }
-                  },
-                  "required": ["file_path"]
-                }
-              }
-            }]
-        }))
-        .await?;
 
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    eprintln!("Logs from your program will appear here!");
-    
-    if let Some(tool_calls) = response["choices"][0]["message"]["tool_calls"].as_array() {
+    let mut messages: Vec<ChatCompletionRequestMessage> = vec![
+        ChatCompletionRequestUserMessageArgs::default().content(args.prompt.clone()).build()?.into()
+    ];
+
+    let tools: Vec<ChatCompletionTools> = vec![ ChatCompletionTools::Function(ChatCompletionTool { function: FunctionObjectArgs::default()
+            .name("Read")
+            .description("Read and return the contents of a file")
+            .parameters(json!({
+                "type": "object",
+                "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to read"
+                }
+                },
+                "required": ["file_path"]
+            }))
+            .build()?
+            .into()
+        })
+    ];
+
+    loop {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("anthropic/claude-haiku-4.5")
+            .messages(messages.clone())
+            .tools(tools.clone())
+            .build()?;
+
+        let response = client.chat().create(request).await?;
+
+        let Some(choice) = response.choices.into_iter().next() else {
+            break;
+        };
+        let message = choice.message;
+
+        // Append the model's response to the conversation. Only set fields that
+        // are present — the builder strips `Option`, so it wants the inner value.
+        let mut assistant = ChatCompletionRequestAssistantMessageArgs::default();
+        if let Some(content) = message.content.clone() {
+            assistant.content(content);
+        }
+        if let Some(refusal) = message.refusal {
+            assistant.refusal(refusal);
+        }
+        if let Some(tool_calls) = message.tool_calls.clone() {
+            assistant.tool_calls(tool_calls);
+        }
+        messages.push(assistant.build()?.into());
+
+        // No tool calls means the model gave a final answer — print it and stop.
+        let Some(tool_calls) = message.tool_calls else {
+            if let Some(content) = message.content {
+                println!("{content}");
+            }
+            break;
+        };
+
+        // Otherwise run each tool call and feed its result back as a tool message.
         for tool_call in tool_calls {
-            let Some(name) = tool_call.get("function").and_then(|f| f.get("name")).and_then(|f| f.as_str()) else {
+            let ChatCompletionMessageToolCalls::Function(call) = tool_call else {
                 continue;
             };
-            
-            if name != "Read" {
+
+            if call.function.name != "Read" {
                 continue;
             }
 
-            let arguments: Value = match extract_tool_arguments(tool_call) {
+            let arguments: Value = match serde_json::from_str(&call.function.arguments) {
                 Ok(args) => args,
                 Err(e) => {
                     eprintln!("Failed to parse Read arguments: {e}");
@@ -88,16 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
 
-            let mut file = File::open(file_path).await?;
+            let result = match tokio::fs::read_to_string(file_path).await {
+                Ok(contents) => contents,
+                Err(e) => format!("Error reading {file_path}: {e}"),
+            };
 
-            let mut stdout = io::stdout();
-
-            io::copy(&mut file, &mut stdout).await?;
+            let tool_message = ChatCompletionRequestToolMessageArgs::default()
+                .content(result)
+                .tool_call_id(call.id)
+                .build()?;
+            messages.push(tool_message.into());
         }
-    }
-
-    if let Some(content) = response["choices"][0]["message"]["content"].as_str() {
-        println!("{}", content);
     }
 
     Ok(())
