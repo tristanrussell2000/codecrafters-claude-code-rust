@@ -1,7 +1,7 @@
 use async_openai::{Client, config::OpenAIConfig, types::chat::{ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FunctionObjectArgs}};
 use clap::Parser;
 use serde_json::{Value, json};
-use std::{env, process};
+use std::{env, process::{self, Command}};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -66,6 +66,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "type": "string",
                     "description": "The content to write to the file"
                   }
+                }
+            }))
+            .build()?
+            .into()
+        }),
+        ChatCompletionTools::Function(ChatCompletionTool { 
+            function: FunctionObjectArgs::default()
+            .name("Bash")
+            .description("Execute a shell command")
+            .parameters(json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to execute"
+                    }
                 }
             }))
             .build()?
@@ -148,6 +165,20 @@ async fn run_tool(call: &ChatCompletionMessageToolCall) -> Result<String, String
                 .await
                 .map_err(|e| format!("Error writing {file_path}: {e}"))?;
             Ok(format!("Wrote {} bytes to {file_path}", content.len()))
+        }
+        "Bash" => {
+            let command = arguments["command"]
+            .as_str()
+            .ok_or("Missing required argument 'command'")?;
+
+            let output = Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .map_err(|e| format!("Error using bash command: {e}"))?;
+
+            let output_str = String::from_utf8(output.stdout).map_err(|e| format!("Command succeeded but failed to parse stdout as a string: {e}"))?;
+            Ok(output_str)
         }
         other => Err(format!("Unknown tool '{other}'")),
     }
